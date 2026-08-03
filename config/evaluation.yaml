@@ -1,10 +1,9 @@
 
-dataset: piad
-setting: seen
-ckpt: ckpt/piad_seen.pt
+dataset: laso
+setting: unseen
+ckpt: /home/junbo/wyn/model/geal/laso_unseen.pt
 seed: 10043
-data_root: piad_dataset
-
+data_root: /home/datasets/LASO_dataset
 model_3d:
   normal_channel: false
   num_heads: 4
@@ -13,7 +12,7 @@ model_3d:
   n_groups: 40
   project_dim: 64
   freeze_text_encoder: false
-  text_encoder_type: roberta-base
+  text_encoder_type: /home/junbo/wyn/model/roberta-base
   training: false
   level: 3
   fuse_level: false

@@ -50,6 +50,8 @@ class Branch2D(nn.Module):
         self.normalize_std = cfg.get("normalize_std", [0.229, 0.224, 0.225])
         self.render_resolution = render_cfg["render_resolution"]
         self.fuse_level = cfg.get("fuse_level", False)
+        self.use_affordance_proj = cfg.get("use_affordance_proj", False)
+        self.affordance_dim = cfg.get("affordance_dim", self.llm_dim)
 
         # ====== Text encoder (frozen or fine-tuned) ======
         self.text_encoder = AutoModel.from_pretrained(self.text_encoder_type)
@@ -66,7 +68,7 @@ class Branch2D(nn.Module):
         )
 
         # ====== DINOv2 Backbone (frozen) ======
-        self.dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14').cuda()
+        self.dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
         for p in self.dino_model.parameters():
             p.requires_grad = False
 
@@ -107,6 +109,15 @@ class Branch2D(nn.Module):
         decoder_layer = TransformerDecoderLayer(self.llm_dim, nheads=self.num_heads, dropout=0)
         self.decoder = TransformerDecoder(decoder_layer, num_layers=1, norm=nn.LayerNorm(self.llm_dim))
         self.pos1d = nn.Parameter(torch.zeros(1, self.n_groups, self.llm_dim))
+
+        # ====== §9 Lightweight Pipeline: AffordanceProj ======
+        if self.use_affordance_proj:
+            self.affordance_proj = nn.Sequential(
+                nn.Linear(self.dino_dim, self.affordance_dim),
+                nn.GELU(),
+                nn.Linear(self.affordance_dim, self.affordance_dim),
+                nn.LayerNorm(self.affordance_dim),
+            )
 
         # ====== Upsampling modules ======
         self.learnable_upsample = SmallUpsampleNet(
@@ -189,6 +200,30 @@ class Branch2D(nn.Module):
             return fused_features, render_feats
 
     # ----------------------------------------------------------------------
+
+    def get_raw_dino_features(self, image):
+        """
+        Extract raw DINOv2 patch tokens from RGB image(s).
+
+        Used by the §9 lightweight pipeline to build the invariant
+        affordance embedding (L_invariant / L_3d2img).
+
+        Args:
+            image: [B, 3, H, W] batched normalized RGB tensors
+                   (or [3, H, W] for a single image).
+
+        Returns:
+            patch_feat: [B, N_patches, dino_dim]
+            global_feat: [B, dino_dim] — mean of patch tokens per sample
+        """
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        layers = self.dino_model.get_intermediate_layers(
+            image, n=self.num_levels, return_class_token=True
+        )
+        patch_feat = layers[-1][0]  # [B, N, dino_dim]
+        global_feat = patch_feat.mean(1)  # [B, dino_dim]
+        return patch_feat, global_feat
 
     def _render_views(self, xyz, features_3d):
         """

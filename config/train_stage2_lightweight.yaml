@@ -1,16 +1,40 @@
+# ============================================================
+# §9 Lightweight Pipeline: Invariant Affordance Knowledge
+# ============================================================
+# MIFAG-inspired pipeline that learns invariant 2D affordance
+# embeddings from interaction images and aligns them with 3D
+# point features.  Gated by use_new_losses / use_invariant_loss
+# / use_3d2img_loss in the training script.
+#
+# Differences from train_stage2.yaml:
+#   - dataset.category: piad   (needs interaction images)
+#   - dataset.use_image: true  (sample k_images per sample)
+#   - model_2d.use_affordance_proj: true (trainable head)
+#   - §9 loss weights instead of legacy losses
+# ============================================================
+
 train:
   seed: 42
   epochs: 50
   batch_size: 8
   save_dir: runs/train/
-  name: geal_stage2
+  name: geal_stage2_lightweight
   storage: true
-  log_name: train.log
-  resume: true
-  checkpoint_path: runs/train/geal_stage2/best_model_geal_stage2_at_06.20_10.41.32.pt
-  pretrained_2d: runs/train/geal_stage1/best_model_geal_stage1_LASO.pt
+  log_name: train_lightweight1.log
+  resume: false
+  checkpoint_path: ""
+  pretrained_2d: runs/train/geal_stage1/best_model_geal_stage1_PIAD.pt
   gpu: 0
   kl_loss_weight: 0.1
+
+  # --- §9 Lightweight Pipeline ---
+  use_new_losses: true       # master switch for §9 pipeline
+  use_invariant_loss: true   # L_invariant: cross-image consistency
+  use_3d2img_loss: true      # L_3d2img: 3D→2D alignment (gradient source)
+  use_contrastive_loss: false # L_contrastive: per-point contrastive (optional)
+  inv_loss_weight: 0.1
+  loss_3d2img_weight: 0.5
+  contrastive_loss_weight: 0.1
 
 optimizer:
   lr: 1e-4
@@ -23,7 +47,7 @@ renderer:
   sh_degree: 3
   render_resolution: 112
 
-model_2d: 
+model_2d:
   stage1: false
   level: 3
   emb_dim: 512
@@ -37,11 +61,15 @@ model_2d:
   normalize_mean: [0.485, 0.456, 0.406]
   normalize_std: [0.229, 0.224, 0.225]
   fuse_level: true
+  # §9 Pipeline: trainable AffordanceProj head
+  use_affordance_proj: true
+  affordance_dim: 512
 
 model_3d:
   normal_channel: false
   num_heads: 4
   emb_dim: 512
+  llm_dim: 512
   N_p: 64
   n_groups: 40
   project_dim: 64
@@ -90,10 +118,13 @@ model_3d:
       mlp: [512, 512]
 
 dataset:
-  category: laso
+  category: piad
   train_split: train
   test_split: test
   setting: seen
   num_workers: 8
   shuffle: true
-  data_root: /home/datasets/LASO_dataset
+  data_root: /home/datasets/PIAD_root
+  use_image: true
+  k_images: 3
+  img_size: 224

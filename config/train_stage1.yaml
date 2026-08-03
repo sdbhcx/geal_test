@@ -31,7 +31,7 @@ model_2d:
   llm_dim: 512
   project_dim: 64
   freeze_text_encoder: false
-  text_encoder_type: roberta-base
+  text_encoder_type: /home/junbo/wyn/model/roberta-base
   normalize_mean: [0.485, 0.456, 0.406]
   normalize_std: [0.229, 0.224, 0.225]
   fuse_level: true
@@ -43,4 +43,4 @@ dataset:
   setting: seen
   num_workers: 8
   shuffle: true
-  data_root: laso_root
+  data_root: /home/datasets/LASO_dataset
