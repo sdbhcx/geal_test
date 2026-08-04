@@ -83,13 +83,21 @@ def build_dataloader(cfg):
     return train_loader, test_loader
 
 
-def build_optimizer(model, opt_cfg):
-    """Set up optimizer and scheduler for 3D branch."""
+def build_optimizer(model_3d, opt_cfg, model_2d=None):
+    """Set up optimizer and scheduler for the 3D branch and AffordanceProj."""
     param_dicts = [
-        {"params": [p for n, p in model.named_parameters() if "text_encoder" not in n and p.requires_grad]},
-        {"params": [p for n, p in model.named_parameters() if "text_encoder" in n and p.requires_grad],
+        {"params": [p for n, p in model_3d.named_parameters()
+                    if "text_encoder" not in n and p.requires_grad]},
+        {"params": [p for n, p in model_3d.named_parameters()
+                    if "text_encoder" in n and p.requires_grad],
          "lr": opt_cfg["tlr"]},
     ]
+    if model_2d is not None and hasattr(model_2d, "affordance_proj"):
+        param_dicts.append({
+            "params": model_2d.affordance_proj.parameters(),
+            "lr": opt_cfg["lr"],
+        })
+
     optimizer = torch.optim.Adam(
         params=param_dicts,
         lr=opt_cfg["lr"],
@@ -134,6 +142,9 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
 
     # ── §9 Lightweight Pipeline ──────────────────────────────────────────
     use_lw = train_cfg.get("use_new_losses", False) and _HAS_LIGHTWEIGHT
+    if use_lw and hasattr(model_2d, "affordance_proj"):
+        for p in model_2d.affordance_proj.parameters():
+            p.requires_grad = True
 
     for i, batch in enumerate(loader):
         optimizer.zero_grad()
@@ -322,7 +333,11 @@ def main(cfg_path="config/train_stage2.yaml"):
         ckpt = torch.load(ckpt_path, map_location=device)
         model_3d.load_state_dict(ckpt["model"], strict=False)
 
-    optimizer, scheduler = build_optimizer(model_3d, cfg["optimizer"])
+    use_lw = train_cfg.get("use_new_losses", False) and _HAS_LIGHTWEIGHT
+    model_2d_for_opt = model_2d if use_lw else None
+    optimizer, scheduler = build_optimizer(
+        model_3d, cfg["optimizer"], model_2d=model_2d_for_opt
+    )
 
     # §9 Lightweight Pipeline: build projectors (img_3d_proj, anchor_proj)
     img_3d_proj, anchor_proj = None, None
