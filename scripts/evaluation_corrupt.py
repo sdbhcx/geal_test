@@ -17,6 +17,7 @@ import sys
 sys.path.append(".")
 
 from model.branch_3d import Branch3D
+from model.local_3d_tokenizer import validate_local_tokenizer_checkpoint
 from dataset.corrupt import CorruptDataset
 from utils.utils import seed_torch, read_yaml
 from utils.metrics import calculate_batch_iou_auc, calculate_batch_sim, calculate_batch_mae
@@ -100,6 +101,11 @@ def main():
     ckpt = torch.load(cfg["ckpt"], map_location=device)
     model.load_state_dict(ckpt["model"], strict=False)
     model.to(device)
+
+    # Validate checkpoint contains tokenizer weights when feature is enabled.
+    if model.use_local_tokenizer:
+        validate_local_tokenizer_checkpoint(ckpt["model"])
+
     print(f"\n Checkpoint loaded: {cfg['ckpt']}")
 
     results = {}

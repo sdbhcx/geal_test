@@ -17,6 +17,7 @@ import sys
 sys.path.append(".")
 
 from model.branch_3d import Branch3D
+from model.local_3d_tokenizer import validate_local_tokenizer_checkpoint
 from dataset.laso import LasoDataset
 from dataset.piad import PiadDataset
 from utils.utils import seed_torch, read_yaml
@@ -175,6 +176,10 @@ def main():
     ckpt = torch.load(cfg["ckpt"], map_location=device)
     status = model.load_state_dict(ckpt["model"], strict=False)
     model.to(device)
+
+    # Validate checkpoint contains tokenizer weights when feature is enabled.
+    if model.use_local_tokenizer:
+        validate_local_tokenizer_checkpoint(ckpt["model"])
 
     print("\n Checkpoint loaded:", cfg["ckpt"])
     if status.missing_keys:
