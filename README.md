@@ -49,6 +49,7 @@ GEAL is a novel framework designed to enhance the generalization and robustness 
   - [Stage 1: 2D Branch Traing](#stage-1-2d-branch-traing)
   - [Stage 2: 3D Branch Traing](#stage-2-3d-branch-traing)
 - [:test\_tube: Evaluation](#test_tube-evaluation)
+  - [Extended evaluation metrics](#extended-evaluation-metrics)
 - [:framed\_picture: Visualization](#framed_picture-visualization)
   - [Inference \& Point Cloud Export](#inference--point-cloud-export)
   - [Mitsuba Image Rendering](#mitsuba-image-rendering)
@@ -56,6 +57,7 @@ GEAL is a novel framework designed to enhance the generalization and robustness 
 - [:file\_folder: Corrupted Dataset \& Robustness Benchmark](#file_folder-corrupted-dataset--robustness-benchmark)
 - [Citation](#citation)
 - [Acknowledgements](#acknowledgements)
+- [瓶颈](#瓶颈)
 
 
 ## :gear: Installation
@@ -250,6 +252,42 @@ python scripts/evaluation.py --config config/evaluation.yaml
 ```
 The evaluation script will compute per-category, per-affordance, and overall metrics, including IoU, AUC, SIM, and MAE. Results will be automatically saved under `runs/result/`.
 
+### Extended evaluation metrics
+
+`evaluation_extended.py` adds geometry-aware diagnostics without changing the original evaluation protocol:
+
+- fixed-threshold aIoU and small-region aIoU/recall;
+- point-cloud Boundary F-score using k-nearest-neighbor label transitions;
+- false-positive area as false-positive point count and point-ratio proxy;
+- affordance-area buckets: tiny, small, medium and large;
+- density buckets based on mean nearest-neighbor distance;
+- parameter count, trainable parameter count, latency, CUDA peak memory and profiler FLOPs estimate.
+
+Run it from the repository root:
+
+```bash
+python scripts/evaluation_extended.py \\
+    --config config/evaluation.yaml \\
+    --output runs/result/ \\
+    --threshold 0.5 \\
+    --small_region_ratio 0.05 \\
+    --boundary_k 8
+```
+
+The command writes one summary JSON and one per-sample JSONL file. Because this repository stores point labels rather than triangle meshes, `false_positive_area` is a point-count proxy. For non-uniform sampling, interpret `false_positive_area_ratio` rather than the raw count.
+
+For a controlled point-density experiment, evaluate the same samples after deterministic random subsampling:
+
+```bash
+python scripts/evaluation_density.py \\
+    --config config/evaluation.yaml \\
+    --output runs/result/ \\
+    --point_counts 2048,1536,1024,512 \\
+    --repeats 3
+```
+
+The output reports the mean and standard deviation across sampled subsets. Keep the requested point counts above the deepest PointNet++ sampling requirement in the model configuration.
+
 ## :framed_picture: Visualization
 
 We provide point cloud exporting, visualization, and rendering tools under the `visualization` directory.
@@ -336,6 +374,19 @@ Output:
 
 This benchmark measures how well the model generalizes to geometric and structural distortions, following the robustness evaluation protocol described in our paper.
 
+To save all five severity levels instead of only their mean, and to calculate normalized area-under-severity-curve summaries, run:
+
+```bash
+python scripts/evaluation_corrupt_extended.py \\
+    --config config/evaluation_corrupt.yaml \\
+    --output runs/result/ \\
+    --threshold 0.5 \\
+    --small_region_ratio 0.05 \\
+    --boundary_k 8
+```
+
+The output JSON keeps each corruption's complete severity curve for aIoU, AUC, small-region metrics, Boundary F-score and false-positive area ratio.
+
 ## Citation
 If you find this work helpful, please kindly consider citing our paper:
 ```bibtex
@@ -353,3 +404,11 @@ If you find this work helpful, please kindly consider citing our paper:
 
 This work builds upon the generous efforts of the open-source community, especially [LASO](https://github.com/yl3800/LASO), [IAGNet](https://github.com/yyvhang/IAGNet), [OOAL](https://github.com/Reagan1311/OOAL), [DreamGaussian](https://github.com/dreamgaussian/dreamgaussian), and [PointCloud-C](https://github.com/ldkong1205/PointCloud-C).
 We are also grateful to our colleagues and collaborators for their encouragement and insightful discussions.
+
+## 瓶颈
+确定GEAL的主要瓶颈来自:
+ 二维教师没有关注功能部件;
+ CAM的空间对齐过于粗糙;
+ PointNet++的局部边界能力不足;
+ 渲染分辨率导致小区域信息消失;
+ 文本融合没有充分影响三维预测。
