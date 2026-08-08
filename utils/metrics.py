@@ -384,7 +384,7 @@ def aggregate_extended_metrics(records: Sequence[Dict[str, Any]], density_bins: 
                 "count": len(subset),
                 "mean_nn_distance": mean_key("mean_nn_distance", subset),
                 "mean_point_count": mean_key("point_count", subset),
-                "aIoU_50": mean_key("aIoU_50", subset),
+                "IoU_50": mean_key("IoU_50", subset),
                 "AUC": mean_key("AUC", subset),
                 "boundary_fscore": mean_key("boundary_fscore", subset),
                 "false_positive_area_ratio": mean_key("false_positive_area_ratio", subset),

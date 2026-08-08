@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 
-from model.pointnet2_utils import PointNetFeaturePropagation
+from model.pointnet2_utils import PointNetFeaturePropagation, square_distance
 from model.attention import TransformerDecoder, TransformerDecoderLayer
 from model.fusion_block import GAFMBlock
 from model.layers import PointFeatureDownsampler,PointEncoder
@@ -53,6 +53,7 @@ class Branch3D(nn.Module):
         # ====== V1 continuous local 3D tokenizer ======
         tokenizer_cfg = cfg.get("local_tokenizer", {})
         self.use_local_tokenizer = tokenizer_cfg.get("enabled", False)
+        self.return_token_aux = cfg.get("return_token_aux", False)
         self.local_tokenizer = None
         self.token_to_point = None
         self.token_fusion = None
@@ -191,15 +192,30 @@ class Branch3D(nn.Module):
             fused_feat = sum(gates[:, i].view(-1, 1, 1) * dense_feats[i] for i in range(len(dense_feats)))
 
         # ========== Step 5b. V1 local token residual fusion ==========
+        token_aux = None
         if self.use_local_tokenizer:
             xyz_points = xyz.transpose(1, 2).contiguous()
             token_features, token_meta = self.local_tokenizer(xyz_points)
-            token_point_features, _ = self.token_to_point(
+            token_point_features, interp_meta = self.token_to_point(
                 xyz_points,
                 token_meta["centers"],
                 token_features,
             )
             fused_feat = self.token_fusion(fused_feat, token_point_features)
+            token_aux = {
+                **token_meta,
+                **interp_meta,
+            }
+            # Also store original-space interpolation distances for reporting
+            xyz_orig = xyz.transpose(1, 2).contiguous()  # [B, N, 3] in original scale
+            dist_orig = square_distance(xyz_orig, token_meta["centers"]).clamp_min_(0.0)
+            _, point_idx_orig = dist_orig.topk(
+                k=min(interp_meta["point_to_token_idx"].shape[-1], dist_orig.shape[-1]),
+                dim=-1, largest=False, sorted=True,
+            )
+            token_aux["point_to_token_dist_orig"] = torch.sqrt(dist_orig.gather(
+                -1, point_idx_orig
+            ))
 
         # ========== Step 6. Transformer-based decoding ==========
         text_decoded = self.decoder(
@@ -220,6 +236,8 @@ class Branch3D(nn.Module):
             downsampled_feat = downsampled_feat.transpose(1, 2)      # [B, 2048, 64]
             return affordance_map, downsampled_feat
         else:
+            if self.return_token_aux and token_aux is not None:
+                return affordance_map, token_aux
             return affordance_map
         
     # ------------------------------------------------------------------
