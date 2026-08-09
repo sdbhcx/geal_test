@@ -252,41 +252,86 @@ python scripts/evaluation.py --config config/evaluation.yaml
 ```
 The evaluation script will compute per-category, per-affordance, and overall metrics, including IoU, AUC, SIM, and MAE. Results will be automatically saved under `runs/result/`.
 
-### Extended evaluation metrics
+### 扩展评估指标
 
-`evaluation_extended.py` adds geometry-aware diagnostics without changing the original evaluation protocol:
-
-- fixed-threshold aIoU and small-region aIoU/recall;
-- point-cloud Boundary F-score using k-nearest-neighbor label transitions;
-- false-positive area as false-positive point count and point-ratio proxy;
-- affordance-area buckets: tiny, small, medium and large;
-- density buckets based on mean nearest-neighbor distance;
-- parameter count, trainable parameter count, latency, CUDA peak memory and profiler FLOPs estimate.
-
-Run it from the repository root:
+`evaluate_region_metrics.py` 在不改变原始评估协议的前提下，提供了几何感知的诊断指标。该脚本合并了原来的 `evaluation_extended.py` 和 `evaluation_density.py`，将所有必要指标统一到一个流程中。
 
 ```bash
-python scripts/evaluation_extended.py \\
-    --config config/evaluation.yaml \\
-    --output runs/result/ \\
-    --threshold 0.5 \\
-    --small_region_ratio 0.05 \\
-    --boundary_k 8
+python scripts/evaluate_region_metrics.py \\
+    --config config/evaluation_v1_tokenizer.yaml \\
+    --output runs/result_region/
 ```
 
-The command writes one summary JSON and one per-sample JSONL file. Because this repository stores point labels rather than triangle meshes, `false_positive_area` is a point-count proxy. For non-uniform sampling, interpret `false_positive_area_ratio` rather than the raw count.
-
-For a controlled point-density experiment, evaluate the same samples after deterministic random subsampling:
+可控点密度下采样曲线：
 
 ```bash
-python scripts/evaluation_density.py \\
-    --config config/evaluation.yaml \\
-    --output runs/result/ \\
+python scripts/evaluate_region_metrics.py \\
+    --config config/evaluation_v1_tokenizer.yaml \\
+    --output runs/result_region/ \\
+    --downsample \\
     --point_counts 2048,1536,1024,512 \\
     --repeats 3
 ```
 
-The output reports the mean and standard deviation across sampled subsets. Keep the requested point counts above the deepest PointNet++ sampling requirement in the model configuration.
+使用 `--skip_token` 关闭 tokenizer 指标以进行基线对比。
+
+#### 总指标（Overall）
+
+| 指标 | 含义 | 作用 |
+|------|------|------|
+| **overall_aIoU** | 在 0~1 上取 20 个均匀阈值，每个阈值计算 IoU 后取平均 | 主指标，比单一阈值 IoU 更稳健，是对比实验的标准衡量 |
+| **overall_IoU_50** | 固定阈值 0.5 时的 IoU | 实际部署（二值化）时的覆盖精度 |
+| **overall_auc** | ROC-AUC 分数 | 与阈值无关的排序能力，接近 1 说明正负点区分良好 |
+| **overall_recall_50** | 阈值 0.5 下预测为阳性的真阳性点占所有真阳性点的比例 | 衡量"漏报"程度，漏判可操作区域的风险大于误判 |
+| **boundary_f1** | 基于 KNN(k=8) 邻域标签变化检测边界点，预测边界与 GT 边界的 F1 | 衡量区域边缘定位精度；recall 高但 boundary_f1 低说明边界过于平滑 |
+| **overall_fp_ratio** | 阈值 0.5 下误报点数 / 总点数 | 衡量"过预测"倾向；IoU 高但 FP 率也高说明模型靠暴力预测来堆 IoU |
+
+#### Small / Mid / Large 区域分桶
+
+按 GT 阳性点比例分组：Small（≤5%）、Mid（5%–20%）、Large（>20%）。每个桶独立计算 aIoU、IoU_50、AUC、recall_50、boundary_f1、fp_ratio。
+
+| 桶 | 作用 |
+|----|------|
+| **Small** | 最小区域最难预测（邻域信息少），aIoU 通常最低；Small 桶明显落后于 Large 桶说明对小区域泛化不足 |
+| **Mid** | 中等区域是模型的主要舒适区，作为基线参考 |
+| **Large** | 大面积区域容易预测，连 Large 桶都低说明模型整体有问题 |
+
+Overall 均值会掩盖 Small 区域的严重退化，分桶指标能暴露模型到底在哪类区域出问题。
+
+#### Token 统计（仅 tokenizer 启用时）
+
+| 指标 | 含义 | 作用 |
+|------|------|------|
+| **mean/median/max token_to_point_dist** | 每个点到最近 token 中心距离的均值/中位数/最大值 | 衡量 Local 3D Tokenizer 重建精度；距离越小说明 token 对点云覆盖越均匀、插值误差越小 |
+| **mean/min token_coverage** | 在有效半径（点云直径 5%）内被至少一个 token 覆盖的点的比例 | 衡量空间覆盖完整性；min 远低于 mean 说明存在局部覆盖盲区 |
+
+#### 下采样曲线（`--downsample`）
+
+对每个目标点数（默认 2048/1536/1024/512），确定性随机下采样并对齐 label，然后直接用**已训练好的模型推理**（不重新训练）。每个点数重复多次（默认 3 次）使用不同 seed，最终输出 mean ± std。
+
+| 维度 | 作用 |
+|------|------|
+| **点数从 2048 → 512 时指标变化** | 评估模型对点云密度的鲁棒性；部署场景中传感器可能返回比训练时更少的点数 |
+| **std 值** | 评估结果对采样子集的稳定性；std 大说明模型对"选了哪些点"非常敏感 |
+| **boundary_f1 的下降速度** | 边界检测对密度最敏感；若它比其他指标下降更快，说明边界质量严重依赖点云密度 |
+
+seed 仅控制"取哪些点"，不改变模型权重。下采样曲线回答的是：*推理时减少输入点数，模型性能会掉多少？*
+
+#### 指标互补关系
+
+```
+aIoU      →  阈值平均，综合指标
+IoU_50    →  固定阈值，部署指标
+AUC       →  与阈值无关，纯排序能力
+          ↓  aIoU 低 + AUC 高 → 阈值没调好；aIoU 低 + AUC 低 → 模型能力问题
+
+recall_50 →  关注 FN（漏报）
+fp_ratio  →  关注 FP（误报）
+          ↓  recall 高 + fp 高 → 过预测；recall 低 + fp 低 → 欠预测
+
+boundary_f1 →  边缘精度
+            ↓  recall 高 + boundary_f1 低 → 区域覆盖好但边缘模糊
+```
 
 ## :framed_picture: Visualization
 
