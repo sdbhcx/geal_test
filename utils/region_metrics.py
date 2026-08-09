@@ -17,7 +17,6 @@ recall_50 关注"区域内"覆盖，boundary_f1 关注"区域边缘"精度
 
 from __future__ import annotations
 
-import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -29,6 +28,8 @@ try:
 except ImportError:
     cKDTree = None
 
+from sklearn.metrics import roc_auc_score
+
 from utils.metrics import (
     _average_iou,
     _f1_from_masks,
@@ -36,7 +37,6 @@ from utils.metrics import (
     _knn_boundary,
     _recall_at_threshold,
 )
-from model.pointnet2_utils import farthest_point_sample, index_points, square_distance
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -146,58 +146,89 @@ def downsampling_curve(
     dataloader: DataLoader,
     model: torch.nn.Module,
     device: torch.device,
-    ratios: Optional[List[float]] = None,
+    point_counts: Optional[List[int]] = None,
+    repeats: int = 3,
     *,
     seed: int = 42,
-) -> Dict[str, List[float]]:
-    """Evaluate model IoU under progressive point cloud downsampling.
+    small_region_ratio: float = 0.05,
+    boundary_k: int = 8,
+) -> Dict[str, Dict[str, Any]]:
+    """Evaluate model metrics under controlled point-count subsampling.
 
-    For each ratio *r*, keep *r × N* points per sample (FPS-sampled) and
-    re-run the model. Returns per-ratio mean IoU and AUC.
+    For each target point count, randomly subsamples points (with label
+    alignment), runs the model, and computes per-sample region metrics across
+    repeats. Returns per-point-count mean and std for key metrics.
     """
-    ratios = ratios or [1.0, 0.75, 0.5, 0.25, 0.1]
-    ratios = sorted(set(ratios), reverse=True)
+    point_counts = point_counts or [2048, 1536, 1024, 512]
+    metric_keys = ["aIoU", "IoU_50", "auc", "recall_50", "boundary_f1", "fp_ratio"]
 
-    results: Dict[str, List[float]] = {
-        "ratios": ratios,
-        "iou": [],
-        "auc": [],
-    }
-
-    from utils.metrics import calculate_batch_iou_auc
-
+    results: Dict[str, Dict[str, Any]] = {}
     model.eval()
-    rng = random.Random(seed)
-    np_rng = np.random.default_rng(seed)
 
     with torch.no_grad():
-        for r in ratios:
-            iou_list: List[float] = []
-            auc_list: List[float] = []
-            n_pts = max(1, int(round(r * 2048)))  # default 2048
+        for pc in point_counts:
+            repeat_records: Dict[int, List[Dict[str, Any]]] = {}
+            for rep in range(repeats):
+                repeat_records[rep] = []
+                for batch_idx, batch in enumerate(dataloader):
+                    point, cls, _, question, aff_label, label = _unpack_batch(batch)
+                    total_points = point.shape[-1]
+                    if pc >= total_points:
+                        indices = torch.arange(total_points)
+                    else:
+                        gen = torch.Generator(device="cpu")
+                        gen.manual_seed(seed + rep * 1_000_003 + batch_idx)
+                        indices = torch.randperm(total_points, generator=gen)[:pc].sort().values
 
-            for batch in dataloader:
-                point, cls, _, question, aff_label, label = _unpack_batch(batch)
-                point = point.float().to(device)
-                label = label.float().to(device)
+                    sampled_point = point[:, :, indices].float().to(device)
+                    sampled_label = label[:, indices].float().to(device)
+                    pred = model(question, sampled_point)
+                    if isinstance(pred, (tuple, list)):
+                        pred = pred[0]
 
-                # FPS downsample points and labels
-                xyz = point.transpose(1, 2).contiguous()  # [B, N, 3]
-                keep_idx = farthest_point_sample(xyz, n_pts)
-                xyz_ds = index_points(xyz, keep_idx)
-                label_ds = index_points(label.unsqueeze(1), keep_idx).squeeze(1)
-                pred_ds = model(question, xyz_ds.transpose(1, 2))
-                if isinstance(pred_ds, (tuple, list)):
-                    pred_ds = pred_ds[0]
+                    pred_np = pred.cpu().numpy()
+                    label_np = sampled_label.cpu().numpy()
+                    xyz_np = sampled_point.cpu().numpy().transpose(0, 2, 1)
 
-                iou_batch, auc_batch = calculate_batch_iou_auc(
-                    pred_ds.cpu().numpy(), label_ds.cpu().numpy()
+                    for i in range(pred_np.shape[0]):
+                        rec = _sample_region_metrics(
+                            pred_np[i], label_np[i], xyz_np[i],
+                            small_region_ratio=small_region_ratio,
+                            boundary_k=boundary_k,
+                        )
+                        if rec is not None:
+                            repeat_records[rep].append(rec)
+
+            pc_result: Dict[str, Any] = {
+                "point_count": pc,
+                "repeats": repeats,
+                "repeat_details": [],
+            }
+            for rep in range(repeats):
+                recs = repeat_records[rep]
+                if not recs:
+                    pc_result["repeat_details"].append({"count": 0})
+                    continue
+                detail = {"count": len(recs)}
+                for mk in metric_keys:
+                    detail[mk] = float(np.nanmean([r[mk] for r in recs]))
+                pc_result["repeat_details"].append(detail)
+
+            pc_result["mean"] = {}
+            pc_result["std"] = {}
+            for mk in metric_keys:
+                vals = np.asarray(
+                    [d.get(mk, float("nan")) for d in pc_result["repeat_details"] if mk in d],
+                    dtype=np.float64,
                 )
-                iou_list.extend([v for v in iou_batch if not np.isnan(v)])
-                auc_list.extend([v for v in auc_batch if not np.isnan(v)])
+                pc_result["mean"][mk] = (
+                    float(np.nanmean(vals)) if np.any(np.isfinite(vals)) else float("nan")
+                )
+                pc_result["std"][mk] = (
+                    float(np.nanstd(vals)) if np.any(np.isfinite(vals)) else float("nan")
+                )
 
-            results["iou"].append(float(np.mean(iou_list)) if iou_list else float("nan"))
-            results["auc"].append(float(np.mean(auc_list)) if auc_list else float("nan"))
+            results[str(pc)] = pc_result
 
     return results
 
@@ -249,6 +280,16 @@ def _sample_region_metrics(
     iou_50 = _iou_at_threshold(pred_score, gt_mask, 0.5)
     recall_50 = _recall_at_threshold(pred_score, gt_mask, 0.5)
 
+    # AUC (ROC-AUC)
+    try:
+        auc = float(roc_auc_score(gt_mask.astype(np.uint8), pred_score))
+    except ValueError:
+        auc = float("nan")
+
+    # False-positive area ratio (point-count proxy under uniform sampling)
+    fp_count = int(np.sum(pred_mask & ~gt_mask))
+    fp_ratio = float(fp_count / max(n, 1))
+
     # Boundary detection via KNN
     gt_boundary = _knn_boundary(gt_mask, points, boundary_k)
     pred_boundary = _knn_boundary(pred_mask, points, boundary_k)
@@ -260,8 +301,10 @@ def _sample_region_metrics(
     return {
         "aIoU": a_iou,
         "IoU_50": iou_50,
+        "auc": auc,
         "recall_50": recall_50,
         "boundary_f1": boundary_f1,
+        "fp_ratio": fp_ratio,
         "gt_ratio": gt_ratio,
         "gt_positive": gt_positive,
         "point_count": n,
@@ -301,8 +344,10 @@ def _bin_by_region_size(
             "count": len(subset),
             "aIoU": float(np.nanmean([r["aIoU"] for r in subset])),
             "IoU_50": float(np.nanmean([r["IoU_50"] for r in subset])),
+            "auc": float(np.nanmean([r["auc"] for r in subset])),
             "recall_50": float(np.nanmean([r["recall_50"] for r in subset])),
             "boundary_f1": float(np.nanmean([r["boundary_f1"] for r in subset])),
+            "fp_ratio": float(np.nanmean([r["fp_ratio"] for r in subset])),
             "mean_gt_ratio": float(np.mean([r["gt_ratio"] for r in subset])),
         }
     return result
@@ -323,8 +368,11 @@ def _compute_overall(records: List[Dict[str, Any]]) -> Dict[str, float]:
             r["aIoU"] for r in records if r["bucket"] == "small"
         ])),
         "overall_aIoU": float(np.nanmean([r["aIoU"] for r in records])),
+        "overall_IoU_50": float(np.nanmean([r["IoU_50"] for r in records])),
+        "overall_auc": float(np.nanmean([r["auc"] for r in records])),
         "overall_recall_50": float(overall_recall),
         "boundary_f1": float(np.nanmean(boundary_f1s)),
+        "overall_fp_ratio": float(np.nanmean([r["fp_ratio"] for r in records])),
         "small_region_count": int(sum(1 for r in records if r["bucket"] == "small")),
         "mid_region_count": int(sum(1 for r in records if r["bucket"] == "mid")),
         "large_region_count": int(sum(1 for r in records if r["bucket"] == "large")),
@@ -385,7 +433,7 @@ def format_region_metrics(metrics: Dict[str, Dict[str, Any]]) -> str:
     if overall:
         lines.append("")
         lines.append("Overall:")
-        for k in ("overall_aIoU", "overall_recall_50", "boundary_f1"):
+        for k in ("overall_aIoU", "overall_IoU_50", "overall_auc", "overall_recall_50", "boundary_f1", "overall_fp_ratio"):
             v = overall.get(k, float("nan"))
             lines.append(f"  {k:25s}: {v:.4f}")
         lines.append(f"  {'small_region_count':25s}: {overall.get('small_region_count', 'N/A')}")
@@ -396,15 +444,16 @@ def format_region_metrics(metrics: Dict[str, Dict[str, Any]]) -> str:
     if by_bucket:
         lines.append("")
         lines.append("By Region Bucket:")
-        lines.append(f"  {'Bucket':<8s} {'Count':>6s} {'aIoU':>8s} {'IoU_50':>8s} {'Recall':>8s} {'BndF1':>8s} {'GT_Ratio':>9s}")
+        lines.append(f"  {'Bucket':<8s} {'Count':>6s} {'aIoU':>8s} {'IoU_50':>8s} {'AUC':>8s} {'Recall':>8s} {'BndF1':>8s} {'FPRatio':>8s} {'GT_Ratio':>9s}")
         for name in ("small", "mid", "large"):
             b = by_bucket.get(name, {})
             if b.get("count", 0) == 0:
-                lines.append(f"  {name:<8s} {'0':>6s} {'N/A':>8s} {'N/A':>8s} {'N/A':>8s} {'N/A':>8s} {'N/A':>9s}")
+                lines.append(f"  {name:<8s} {'0':>6s} {'N/A':>8s} {'N/A':>8s} {'N/A':>8s} {'N/A':>8s} {'N/A':>8s} {'N/A':>8s} {'N/A':>9s}")
                 continue
             lines.append(
                 f"  {name:<8s} {b['count']:>6d} {b['aIoU']:>8.4f} {b['IoU_50']:>8.4f} "
-                f"{b['recall_50']:>8.4f} {b['boundary_f1']:>8.4f} {b['mean_gt_ratio']:>9.4f}"
+                f"{b['auc']:>8.4f} {b['recall_50']:>8.4f} {b['boundary_f1']:>8.4f} "
+                f"{b['fp_ratio']:>8.4f} {b['mean_gt_ratio']:>9.4f}"
             )
 
     token = metrics.get("token", {})

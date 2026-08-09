@@ -85,7 +85,19 @@ def main():
     parser.add_argument(
         "--downsample",
         action="store_true",
-        help="Run point-downsampling curve (slower)",
+        help="Run point-downsampling curve with controlled subsampling (slower)",
+    )
+    parser.add_argument(
+        "--point_counts",
+        type=str,
+        default="2048,1536,1024,512",
+        help="Comma-separated target point counts for downsampling (default: 2048,1536,1024,512)",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="Number of repeats per point count for downsampling (default: 3)",
     )
     parser.add_argument(
         "--skip_token",
@@ -139,23 +151,37 @@ def main():
     if args.downsample:
         print("\nRunning downsampling curve...")
         t0 = time.perf_counter()
-        ds = downsampling_curve(loader, model, device, seed=cfg.get("seed", 42))
+        point_counts = [int(v.strip()) for v in args.point_counts.split(",") if v.strip()]
+        ds = downsampling_curve(
+            loader, model, device,
+            point_counts=point_counts,
+            repeats=args.repeats,
+            seed=cfg.get("seed", 42),
+        )
         elapsed = time.perf_counter() - t0
         print(f"  Done in {elapsed:.1f}s")
+
+        metric_keys = ["aIoU", "IoU_50", "auc", "recall_50", "boundary_f1", "fp_ratio"]
 
         ds_path = os.path.join(
             args.output,
             f"{cfg['dataset']}_{cfg['setting']}{args.name}_downsample.txt",
         )
         with open(ds_path, "w") as f:
-            f.write("Point Downsampling Curve:\n")
-            f.write(f"  {'Ratio':>8s}  {'IoU':>8s}  {'AUC':>8s}\n")
-            for r, iou, auc in zip(ds["ratios"], ds["iou"], ds["auc"]):
-                f.write(f"  {r:>8.2f}  {iou:>8.4f}  {auc:>8.4f}\n")
+            f.write("Point Downsampling Curve (random subsampling with repeats):\n")
+            f.write(f"  {'Pts':>6s}  " + "  ".join(f"{k:>10s}_mean  {k:>10s}_std" for k in metric_keys) + "\n")
+            for pc_str, pc_data in ds.items():
+                row = f"  {pc_str:>6s}  "
+                for mk in metric_keys:
+                    row += f"{pc_data['mean'][mk]:>10.4f}  {pc_data['std'][mk]:>10.4f}  "
+                f.write(row + "\n")
         print(f"  Downsampling curve saved: {ds_path}")
 
-        for r, iou, auc in zip(ds["ratios"], ds["iou"], ds["auc"]):
-            print(f"    {r:.2f}  IoU={iou:.4f}  AUC={auc:.4f}")
+        for pc_str, pc_data in ds.items():
+            parts = [f"{pc_str}pts:"]
+            for mk in metric_keys:
+                parts.append(f"{mk}={pc_data['mean'][mk]:.4f}±{pc_data['std'][mk]:.4f}")
+            print(f"    {'  '.join(parts)}")
 
 
 if __name__ == "__main__":

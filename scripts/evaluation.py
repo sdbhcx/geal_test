@@ -163,9 +163,11 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--name", type=str, default="1")
 
     args = parser.parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    name = args.name
 
     # Load config and model
     cfg = read_yaml(args.config)
@@ -198,8 +200,8 @@ def main():
     category_metrics, affordance_metrics, overall_metrics = evaluate(model, loader, device)
 
     # Save results
-    ckpt_name = os.path.splitext(os.path.basename(cfg["ckpt"]))[0]
-    output_file = os.path.join(args.output, f"{ckpt_name}_{cfg['dataset']}_{cfg['setting']}.txt")
+    # ckpt_name = os.path.splitext(os.path.basename(cfg["ckpt"]))[0]
+    output_file = os.path.join(args.output, f"{cfg['dataset']}_{cfg['setting']}{name}.txt")
     save_metrics(category_metrics, affordance_metrics, overall_metrics, output_file)
 
 
