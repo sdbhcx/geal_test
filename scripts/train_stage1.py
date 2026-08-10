@@ -13,10 +13,12 @@ sys.path.append(".")
 from utils.utils import seed_torch, read_yaml
 from utils.logger import setup_logger
 from utils.metrics import evaluating_2d
+from utils.loss import info_nce
 from renderer.gaussian_render import Gaussian_Renderer
 from model.branch_2d import Branch2D
 from dataset.laso import LasoDataset
 from dataset.piad import PiadDataset
+from dataset.data_utils import CLASSES, AFFORDANCES
 
 def count_trainable_params(model):
     """
@@ -44,7 +46,10 @@ def build_dataloader(cfg):
         train_loader, test_loader
     """
     if cfg["category"] == "piad":
-        train_dataset = PiadDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])
+        use_image = cfg.get("use_image", False)
+        img_size = cfg.get("img_size", 224)
+        train_dataset = PiadDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"],
+                                    use_image=use_image, img_size=img_size)
         test_dataset = PiadDataset(cfg["test_split"], data_root=cfg["data_root"])
     elif cfg["category"] == "laso":
         train_dataset = LasoDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])
@@ -94,7 +99,8 @@ def build_optimizer(model, opt_cfg):
     return optimizer, scheduler
 
 
-def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch):
+def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch,
+                    use_image=False, align_weight=0.2, temp=0.07):
     """
     Run one training epoch.
 
@@ -102,12 +108,21 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch):
       - Render GT grayscale maps from 3D points and labels
       - Forward pass through the 2D model
       - Compute binary cross-entropy loss (pixel-wise)
+      - (optional) Add InfoNCE alignment between rendered-view and interaction-image
+        affordance embeddings to inject real-image knowledge into the 2D teacher
       - Backpropagate and update weights
     """
     model.train()
     loss_sum = 0
 
-    for i, (point, _, _, question, _, label) in enumerate(loader):
+    for i, batch in enumerate(loader):
+        if use_image:
+            point, _, _, question, _, label, image = batch
+            image = image.to(device)
+        else:
+            point, _, _, question, _, label = batch
+            image = None
+
         optimizer.zero_grad()
         point, label = point.to(device), label.to(device)
 
@@ -118,49 +133,96 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch):
             gray_images = gt_images.mean(dim=2, keepdim=True).reshape(-1, 1, render_dim, render_dim)
 
         # Forward pass
-        pred = model(question, point)
+        if use_image:
+            pred, z_render, z_img = model(question, point, image=image)
+        else:
+            pred = model(question, point)
 
         # Binary classification loss (affordance heatmap)
         loss = nn.BCELoss()(pred, gray_images)
+
+        # Knowledge-injection loss (teacher detached -> student follows real image)
+        if use_image:
+            loss_align = info_nce(z_render, z_img.detach(), temp=temp)
+            loss = loss + align_weight * loss_align
+
         loss.backward()
         optimizer.step()
 
         loss_sum += loss.item()
         if i % 10 == 0:
-            logger.debug(f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f}")
+            msg = f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f}"
+            if use_image:
+                msg += f" | Align: {loss_align.item():.4f}"
+            logger.debug(msg)
 
     return loss_sum / len(loader)
 
 
 def evaluate(model, loader, device, renderer, logger):
     """
-    Evaluate model performance on validation set using two metrics:
-      - SIM (similarity)
-      - MAE (mean absolute error)
+    Evaluate model performance on validation set.
+    Returns:
+        mMAE: overall mean absolute error
+    Also logs per-category and per-affordance SIM/MAE breakdowns.
     """
     model.eval()
+    num_cls, num_aff = len(CLASSES), len(AFFORDANCES)
+
     SIM_list, MAE_list = [], []
+    cls_sim = [0.0] * num_cls
+    cls_mae = [0.0] * num_cls
+    cls_cnt = [0] * num_cls
+    aff_sim = [0.0] * num_aff
+    aff_mae = [0.0] * num_aff
+    aff_cnt = [0] * num_aff
 
     with torch.no_grad():
-        for i, (point, _, _, question, _, label) in enumerate(loader):
+        for i, (point, cls_id, _, question, aff_id, label) in enumerate(loader):
             point, label = point.to(device), label.to(device)
 
-            # Render GT grayscale maps
             gt_images = torch.stack([renderer(p, l)[0] for p, l in zip(point, label)])
             render_dim = gt_images.shape[-1]
             gray_images = gt_images.mean(dim=2, keepdim=True).reshape(-1, 1, render_dim, render_dim)
 
-            # Prediction
             pred = model(question, point)
 
-            # Convert to numpy for evaluation
             sim, mae = evaluating_2d(pred.cpu().numpy(), gray_images.cpu().numpy())
             SIM_list.append(sim)
             MAE_list.append(mae)
 
+            cls_ids = cls_id.cpu().numpy()
+            aff_ids = aff_id.cpu().numpy()
+            for cid, aid in zip(cls_ids, aff_ids):
+                cls_sim[cid] += sim
+                cls_mae[cid] += mae
+                cls_cnt[cid] += 1
+                aff_sim[aid] += sim
+                aff_mae[aid] += mae
+                aff_cnt[aid] += 1
+
     mSIM = sum(SIM_list) / len(SIM_list)
     mMAE = sum(MAE_list) / len(MAE_list)
     logger.debug(f"Validation → mSIM: {mSIM:.4f}, mMAE: {mMAE:.4f}")
+
+    # Per-category breakdown
+    logger.debug("Validation Per-Category →")
+    logger.debug(f"{'Category':<20} {'SIM':>8} {'MAE':>8} {'Count':>6}")
+    for i in range(num_cls):
+        if cls_cnt[i] > 0:
+            logger.debug(
+                f"{CLASSES[i]:<20} {cls_sim[i]/cls_cnt[i]:>8.4f} {cls_mae[i]/cls_cnt[i]:>8.4f} {cls_cnt[i]:>6d}"
+            )
+
+    # Per-affordance breakdown
+    logger.debug("Validation Per-Affordance →")
+    logger.debug(f"{'Affordance':<20} {'SIM':>8} {'MAE':>8} {'Count':>6}")
+    for i in range(num_aff):
+        if aff_cnt[i] > 0:
+            logger.debug(
+                f"{AFFORDANCES[i]:<20} {aff_sim[i]/aff_cnt[i]:>8.4f} {aff_mae[i]/aff_cnt[i]:>8.4f} {aff_cnt[i]:>6d}"
+            )
+
     return mMAE
 
 
@@ -210,8 +272,14 @@ def main(cfg_path="config/train_stage1.yaml"):
     for epoch in range(train_cfg["epochs"]):
         logger.debug(f"Epoch {epoch} start → learning rate {optimizer.param_groups[0]['lr']:.6f}")
 
+        # Read interaction-image config
+        use_image = cfg["dataset"].get("use_image", False)
+        align_weight = train_cfg.get("img_align_weight", 0.2)
+        temp = train_cfg.get("img_align_temp", 0.07)
+
         # Train and validate
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, renderer, logger, epoch)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, renderer, logger, epoch,
+                                     use_image=use_image, align_weight=align_weight, temp=temp)
         val_mae = evaluate(model, test_loader, device, renderer, logger)
         scheduler.step()
 

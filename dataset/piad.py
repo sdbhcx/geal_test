@@ -60,13 +60,11 @@ class PiadDataset(Dataset):
         # Load affordance rephrasing table
         self.questions = pd.read_csv(os.path.join(data_root, "Affordance-Question.csv"))
 
-        # Optionally load the (class, affordance) -> [image paths] sidecar index
+        # Optionally build the (class, affordance) -> [image paths] index
+        # by scanning the PIAD image folder structure at runtime (no pkl needed).
         self.img_index = None
         if self.use_image:
-            idx_path = os.path.join(data_root, f"{setting}_{split}_img_index.pkl")
-            if os.path.exists(idx_path):
-                with open(idx_path, "rb") as f:
-                    self.img_index = pickle.load(f)
+            self.img_index = self._build_image_index_from_folder()
             self.img_transform = T.Compose([
                 T.Resize((img_size, img_size)),
                 T.ToTensor(),
@@ -177,6 +175,42 @@ class PiadDataset(Dataset):
         path = self._sample_image_path(obj_class, affordance)
         image_pil = Image.open(path).convert("RGB")
         return self.img_transform(image_pil)
+
+    # ------------------------------------------------------------------
+    def _build_image_index_from_folder(self):
+        """
+        Scan the PIAD image folder structure at runtime to build the
+        {(class_lower, affordance): [img_path, ...]} index.
+
+        Folders are laid out as:
+            {data_root}/{setting}/Img/{split}/{Class}/{affordance}/Img_*.jpg
+
+        No pre-generated pkl is required.
+        """
+        img_index = {}
+        # PIAD folders use Title Case (Seen/Img/Train/{Class}/{Affordance}),
+        # so normalize setting and split to Title Case for path construction.
+        setting_dir = self.setting.capitalize()
+        split_dir = self.split.capitalize()
+        base = os.path.join(self.data_root, setting_dir, "Img", split_dir)
+        if not os.path.isdir(base):
+            return img_index
+        for cls_name in sorted(os.listdir(base)):
+            cls_dir = os.path.join(base, cls_name)
+            if not os.path.isdir(cls_dir):
+                continue
+            for aff_name in sorted(os.listdir(cls_dir)):
+                aff_dir = os.path.join(cls_dir, aff_name)
+                if not os.path.isdir(aff_dir):
+                    continue
+                aff_norm = aff_name.replace("wrapgrasp", "wrap_grasp")
+                paths = sorted([
+                    os.path.join(aff_dir, f)
+                    for f in os.listdir(aff_dir) if f.endswith(".jpg")
+                ])
+                if paths:
+                    img_index[(cls_name.lower(), aff_norm)] = paths
+        return img_index
 
     # ------------------------------------------------------------------
     def __len__(self):
