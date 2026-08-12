@@ -80,6 +80,26 @@ class Branch3D(nn.Module):
                 init_value=tokenizer_cfg.get("fusion_init", 0.0),
             )
 
+        # ====== V2 2D→3D soft-prior injection ======
+        # A frozen 2D teacher's per-point affordance guess (q) and its cross-view
+        # uncertainty (u) are injected as a residual on fused_feat, BEFORE the local
+        # tokenizer refines geometry (global soft candidate → local geometric check).
+        # The gate is initialised to 0 so training starts identical to the baseline;
+        # the prior is learned as a gradual correction. At inference, callers simply
+        # omit `soft_prior` to fall back to the pure-3D branch.
+        sp_cfg = cfg.get("soft_prior", {})
+        self.use_soft_prior = sp_cfg.get("enabled", False)
+        self.soft_prior_mode = sp_cfg.get("mode", "vis_unc")
+        if self.use_soft_prior:
+            self.soft_prior_mlp = nn.Sequential(
+                nn.Conv1d(self.emb_dim + 2, self.emb_dim, 1),
+                nn.BatchNorm1d(self.emb_dim),
+                nn.GELU(),
+                nn.Conv1d(self.emb_dim, self.emb_dim, 1),
+            )
+            # Near-zero gate — mirrors TokenFusion's residual_scale=0.0 init.
+            self.soft_prior_gate = nn.Parameter(torch.tensor(0.0))
+
         # ====== Text encoder (frozen or finetuned) ======
         self.text_encoder = AutoModel.from_pretrained(self.text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(self.text_encoder_type)
@@ -142,13 +162,17 @@ class Branch3D(nn.Module):
 
     # ----------------------------------------------------------------------
 
-    def forward(self, text, xyz):
+    def forward(self, text, xyz, soft_prior=None):
         """
         Forward pass of the 3D branch.
 
         Args:
             text (list[str]): Text queries (batch of affordance sentences).
             xyz (Tensor): Input point cloud [B, N, 3].
+            soft_prior (Tensor | None): V2 2D→3D soft prior of shape [B, 2, N],
+                where soft_prior[:, 0] is the prior affordance q and soft_prior[:, 1]
+                is the cross-view uncertainty u. When None (inference or disabled),
+                the branch behaves exactly like the baseline.
 
         Returns:
             - During training: (affordance_pred, downsampled_feats)
@@ -191,7 +215,14 @@ class Branch3D(nn.Module):
             gates, _ = self.gaf_conv(concat_feats)
             fused_feat = sum(gates[:, i].view(-1, 1, 1) * dense_feats[i] for i in range(len(dense_feats)))
 
-        # ========== Step 5b. V1 local token residual fusion ==========
+        # ========== Step 5b. V2 soft-prior residual injection (before tokenizer) ==========
+        if self.use_soft_prior and soft_prior is not None:
+            q = soft_prior[:, 0:1, :]                       # [B, 1, N]
+            u = soft_prior[:, 1:2, :]                       # [B, 1, N]
+            prior_in = torch.cat([fused_feat, q, u], dim=1)  # [B, emb_dim+2, N]
+            fused_feat = fused_feat + self.soft_prior_gate * self.soft_prior_mlp(prior_in)
+
+        # ========== Step 5c. V1 local token residual fusion ==========
         token_aux = None
         if self.use_local_tokenizer:
             xyz_points = xyz.transpose(1, 2).contiguous()

@@ -23,6 +23,7 @@ from dataset.laso import LasoDataset
 from dataset.piad import PiadDataset
 from model.branch_2d import Branch2D
 from model.branch_3d import Branch3D
+from model.soft_prior_backprojector import SoftPriorBackprojector
 from utils.loss import HM_Loss
 
 # §9 Lightweight Pipeline imports (isolated from baseline path)
@@ -116,7 +117,8 @@ def build_optimizer(model_3d, opt_cfg, model_2d=None):
 # ---------------------------------------------------------------------
 
 def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
-                    logger, epoch, train_cfg, img_3d_proj=None, anchor_proj=None):
+                    logger, epoch, train_cfg, img_3d_proj=None, anchor_proj=None,
+                    soft_prior_bp=None):
     """
     One training epoch.
 
@@ -202,11 +204,30 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
                 loss += train_cfg.get("contrastive_loss_weight", 0.1) * lw_cont
 
         else:
-            # ── Baseline path (unchanged) ───────────────────────────────
+            # ── Baseline path ───────────────────────────────────────────
             question = batch[3]
 
-            pred_3d, feat_3d = model_3d(question, point)
-            feat_2d, render_feats = model_2d(question, point, feat_3d)
+            if soft_prior_bp is not None:
+                # --- V2: 2D→3D soft-prior injection ---
+                # 1) Pure-3D forward to obtain the features the 2D renderer splats.
+                pred_3d, feat_3d = model_3d(question, point)
+
+                # 2) Frozen 2D teacher: render + decode affordance map, and pull
+                #    back the splatting correspondences needed for backprojection.
+                feat_2d, render_feats, attn_map, render_idx, rendered_contrib = \
+                    model_2d(question, point, feat_3d, return_affordance_map=True)
+
+                # 3) Backproject the 2D prior onto the point cloud.
+                num_points = point.shape[1]
+                q, u = soft_prior_bp(attn_map, render_idx, rendered_contrib,
+                                     num_points=num_points)
+                soft_prior = torch.stack([q, u], dim=1)   # [B, 2, N]
+
+                # 4) Re-run the 3D branch WITH the injected prior → final outputs.
+                pred_3d, feat_3d = model_3d(question, point, soft_prior=soft_prior)
+            else:
+                pred_3d, feat_3d = model_3d(question, point)
+                feat_2d, render_feats = model_2d(question, point, feat_3d)
 
             loss_kld = nn.MSELoss()(render_feats, feat_2d)
             loss_hm = criterion_hm(pred_3d, label)
@@ -320,6 +341,20 @@ def main(cfg_path="config/train_stage2.yaml"):
     model_3d = Branch3D(cfg["model_3d"]).to(device)
     criterion_hm = HM_Loss().to(device)
 
+    # ── V2 soft-prior backprojector (frozen 2D teacher → 3D points) ──
+    sp_cfg = cfg["model_3d"].get("soft_prior", {})
+    soft_prior_bp = None
+    if sp_cfg.get("enabled", False):
+        soft_prior_bp = SoftPriorBackprojector(
+            mode=sp_cfg.get("mode", "vis_unc"),
+            num_points=cfg["model_3d"].get("num_points",
+                                           cfg["model_3d"].get("N_p", 2048)),
+        ).to(device)
+        logger.debug(
+            f"[V2] soft-prior backprojector enabled | mode={soft_prior_bp.mode} | "
+            f"num_points={soft_prior_bp.num_points}"
+        )
+
     # Load pretrained 2D weights (frozen teacher)
     if train_cfg.get("pretrained_2d", None):
         ckpt_path = train_cfg["pretrained_2d"]
@@ -359,7 +394,8 @@ def main(cfg_path="config/train_stage2.yaml"):
 
         train_loss = train_one_epoch(model_3d, model_2d, train_loader, optimizer, device,
                                      criterion_hm, logger, epoch, train_cfg,
-                                     img_3d_proj=img_3d_proj, anchor_proj=anchor_proj)
+                                     img_3d_proj=img_3d_proj, anchor_proj=anchor_proj,
+                                     soft_prior_bp=soft_prior_bp)
         IOU, mae = evaluate(model_3d, test_loader, device, criterion_hm, logger)
         scheduler.step()
 

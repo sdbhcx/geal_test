@@ -128,7 +128,7 @@ class Branch2D(nn.Module):
 
     # ----------------------------------------------------------------------
 
-    def forward(self, text, xyz, features_3d=None, image=None):
+    def forward(self, text, xyz, features_3d=None, image=None, return_affordance_map=False):
         """
         Forward pass for the 2D branch.
         Args:
@@ -138,15 +138,28 @@ class Branch2D(nn.Module):
             image (Tensor): Optional real interaction image [B, 3, H, W]. When given
                 in stage1, also returns region-level affordance embeddings
                 (z_render, z_img) for the InfoNCE knowledge-injection loss.
+            return_affordance_map (bool): V2 only — when True, the stage2 path also
+                returns the per-view 2D affordance probability map (attn_map) together
+                with the splatting correspondences (render_idx, rendered_contrib) needed
+                by SoftPriorBackprojector. Has no effect in stage1 (which already returns
+                attn_map).
 
         Returns:
-            Tensor: 2D affordance maps of shape [B*n_view, 1, H, W].
-            (when image is not None and stage1) tuple (attn_map, z_render, z_img).
+            Stage1 (image is None): attn_map [B*n_view, 1, H, W].
+            Stage1 (image given):  tuple (attn_map, z_render, z_img).
+            Stage2 (return_affordance_map=False): (fused_features, render_feats).
+            Stage2 (return_affordance_map=True):
+                (fused_features, render_feats, attn_map, render_idx, rendered_contrib)
+                where attn_map is [B*V, 1, H, W] and render_idx / rendered_contrib are
+                [B, V, H, W].
         """
         B = xyz.shape[0]
 
         # ========== Step 1. Differentiable Rendering ==========
-        rendered_images, masks, render_feats = self._render_views(xyz, features_3d)
+        # _render_views now also returns the splatting correspondences (render_idx,
+        # rendered_contrib) that V2 reuses for backprojection.
+        rendered_images, masks, render_feats, render_idx, rendered_contrib = \
+            self._render_views(xyz, features_3d)
         Bn, C, H, W = rendered_images.shape
 
         # ========== Step 2. Extract DINOv2 Features ==========
@@ -218,6 +231,23 @@ class Branch2D(nn.Module):
             # Stage 2: Cross-modal feature fusion (for 3D consistency)
             dense_feat_map = cross_modal_feat.transpose(1, 2).reshape(Bn, -1, H // 14, W // 14)
             fused_features = self.feature_upsampler(dense_feat_map)
+
+            # ----- V2: optionally also emit the 2D affordance probability map -----
+            # Reuses the SAME decoder + learnable upsampler as stage1, but on the
+            # frozen 2D teacher, so it is a stable prior (does not co-adapt with 3D).
+            attn_map = None
+            if return_affordance_map:
+                text_feat = self.decoder(
+                    text_embeds, cross_modal_feat,
+                    tgt_key_padding_mask=text_mask, query_pos=self.pos1d
+                )
+                text_feat *= text_mask.unsqueeze(-1).float()
+                attn = torch.einsum('blc,bcn->bln', text_feat, fused_feat.transpose(1, 2))
+                attn = attn.sum(1) / text_mask.float().sum(1).unsqueeze(-1)
+                attn_map = attn.reshape(Bn, -1, H // 14, W // 14)
+                attn_map = self.learnable_upsample(torch.cat([attn_map, cls_token], dim=1))
+                attn_map = torch.sigmoid(attn_map)
+                return fused_features, render_feats, attn_map, render_idx, rendered_contrib
             return fused_features, render_feats
 
     # ----------------------------------------------------------------------
@@ -282,15 +312,26 @@ class Branch2D(nn.Module):
     def _render_views(self, xyz, features_3d):
         """
         Render point clouds into 2D multi-view images using Gaussian splatting.
+
+        Returns (5-tuple):
+            render_tensor      [B*V, 3, H, W]  normalized depth-RGB images
+            mask_tensor        [B*V, 1, H, W]  foreground mask
+            feat_tensor        [B*V, project_dim, H, W]  rendered 3D feature map
+            idx_tensor         [B, V, H, W]    long, winner point index per pixel
+            contrib_tensor     [B, V, H, W]    per-pixel splatting weight (visibility)
         """
         rendered_images, masks, feats = [], [], []
+        render_idxs, rendered_contribs = [], []
 
         # If no 3D features provided, create iterable of Nones
         if features_3d is None:
             features_3d = [None] * xyz.shape[0]
 
         for pts, f3d in zip(xyz, features_3d):
-            rgb_img, depth_img, _, _, feat = self.renderer(pts, None, f3d)
+            # The renderer returns (rgb, depth, render_idx, rendered_contrib, feat).
+            # render_idx / rendered_contrib are the splatting correspondences that
+            # V2 backprojects the 2D prior through.
+            rgb_img, depth_img, render_idx, rendered_contrib, feat = self.renderer(pts, None, f3d)
             depth_vis = depth_to_rgb(depth_img)
             mask = (rgb_img != 0).all(dim=1, keepdim=True).int()
             norm_img = TF.normalize(depth_vis, mean=self.normalize_mean, std=self.normalize_std)
@@ -298,17 +339,21 @@ class Branch2D(nn.Module):
             rendered_images.append(norm_img)
             masks.append(mask)
             feats.append(feat)
+            render_idxs.append(render_idx)
+            rendered_contribs.append(rendered_contrib)
 
         render_tensor = torch.stack(rendered_images)       # [B, n_views, 3, H, W]
         mask_tensor = torch.stack(masks)
         feat_tensor = torch.stack(feats)
+        idx_tensor = torch.stack(render_idxs)               # [B, V, H, W]
+        contrib_tensor = torch.stack(rendered_contribs)     # [B, V, H, W]
 
         B, V, C, H, W = render_tensor.shape
         render_tensor = render_tensor.view(-1, C, H, W)
         mask_tensor = mask_tensor.view(-1, 1, H, W)
         feat_tensor = feat_tensor.view(-1, self.project_dim, H, W)
 
-        return render_tensor, mask_tensor, feat_tensor
+        return render_tensor, mask_tensor, feat_tensor, idx_tensor, contrib_tensor
 
     # ----------------------------------------------------------------------
 
