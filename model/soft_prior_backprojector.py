@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SoftPriorBackprojector(nn.Module):
@@ -21,8 +22,8 @@ class SoftPriorBackprojector(nn.Module):
 
     Inputs (all view-major, [B, V, ...]):
         attn_map    [B, V, 1, H, W]  2D affordance probability (sigmoid, in [0, 1])
-        render_idx  [B, V, H, W]      long, point index winning each pixel
-        contrib     [B, V, H, W]      per-pixel contribution (visibility proxy)
+        render_idx  [B, V, K, H, W]  long, point index of top-K Gaussians per pixel (K≈5)
+        contrib     [B, V, K, H, W]  per-Gaussian contribution (visibility proxy)
         num_points  int | None        number of 3D points N (== xyz.shape[1])
         c_v         [V] | None        per-view weight (None → uniform 1/V)
 
@@ -49,12 +50,38 @@ class SoftPriorBackprojector(nn.Module):
             num_points = self.num_points
         N = int(num_points)
 
-        B, V, _, H, W = attn_map.shape
-        P = H * W
+        # render_idx / contrib shape: [B, V, K, H, W] where K = max Gaussians per pixel
+        # Pick the top contributor (K=0) for scatter; aggregate contrib over K for visibility.
+        if render_idx.dim() == 5:
+            K = render_idx.shape[2]
+            render_idx = render_idx[:, :, 0, :, :]         # [B, V, H, W]  — winner point index
+            contrib = contrib.sum(dim=2).clamp_min(0.0)    # [B, V, H, W]  — aggregated visibility
+        B, V, H_idx, W_idx = render_idx.shape
 
-        attn = attn_map.reshape(B, V, P)                       # [B, V, P]
+        # attn_map may arrive as [B*V, 1, H, W] from branch_2d; reshape to [B, V, 1, H, W]
+        if attn_map.dim() == 4:
+            _, C, H_attn, W_attn = attn_map.shape
+            attn_map = attn_map.reshape(B, V, C, H_attn, W_attn)
+        H_attn, W_attn = attn_map.shape[-2:]
+
+        # attn_map and render_idx may be at different spatial resolutions.
+        # Align render_idx / contrib to attn_map's resolution for scatter.
+        if H_attn != H_idx or W_attn != W_idx:
+            Bf = B * V
+            render_idx = F.interpolate(
+                render_idx.float().reshape(Bf, 1, H_idx, W_idx),
+                size=(H_attn, W_attn),
+                mode='nearest').reshape(B, V, H_attn, W_attn).long()
+            contrib = F.interpolate(
+                contrib.reshape(Bf, 1, H_idx, W_idx),
+                size=(H_attn, W_attn),
+                mode='bilinear', align_corners=False
+            ).reshape(B, V, H_attn, W_attn).clamp_min(0.0)
+
+        P = H_attn * W_attn
+        attn = attn_map.reshape(B, V, P)
         idx = render_idx.reshape(B, V, P).long().clamp_(0, N - 1)
-        a = contrib.reshape(B, V, P).clamp_min(0.0)            # visibility a_jv
+        a = contrib.reshape(B, V, P).clamp_min(0.0)
 
         if c_v is None:
             c_v = attn.new_ones(V) / V

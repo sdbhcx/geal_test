@@ -150,7 +150,7 @@ class Branch2D(nn.Module):
             Stage2 (return_affordance_map=False): (fused_features, render_feats).
             Stage2 (return_affordance_map=True):
                 (fused_features, render_feats, attn_map, render_idx, rendered_contrib)
-                where attn_map is [B*V, 1, H, W] and render_idx / rendered_contrib are
+                where attn_map is [B, V, 1, H, W] and render_idx / rendered_contrib are
                 [B, V, H, W].
         """
         B = xyz.shape[0]
@@ -247,6 +247,9 @@ class Branch2D(nn.Module):
                 attn_map = attn.reshape(Bn, -1, H // 14, W // 14)
                 attn_map = self.learnable_upsample(torch.cat([attn_map, cls_token], dim=1))
                 attn_map = torch.sigmoid(attn_map)
+                V = Bn // B
+                H_a, W_a = attn_map.shape[-2:]
+                attn_map = attn_map.reshape(B, V, -1, H_a, W_a)
                 return fused_features, render_feats, attn_map, render_idx, rendered_contrib
             return fused_features, render_feats
 

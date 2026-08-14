@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 from sklearn.metrics import roc_auc_score
 import sys
-sys.path.append(".")
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 
 from utils.utils import seed_torch, read_yaml
 from utils.logger import setup_logger
@@ -218,7 +218,7 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
                     model_2d(question, point, feat_3d, return_affordance_map=True)
 
                 # 3) Backproject the 2D prior onto the point cloud.
-                num_points = point.shape[1]
+                num_points = point.shape[-1]
                 q, u = soft_prior_bp(attn_map, render_idx, rendered_contrib,
                                      num_points=num_points)
                 soft_prior = torch.stack([q, u], dim=1)   # [B, 2, N]
@@ -249,6 +249,24 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
                     f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f} "
                     f"(hm: {loss_hm.item():.4f}, mse: {loss_kld.item():.4f})"
                 )
+
+    # Gate diagnostics (V1 tokenizer): log per-epoch gate mean / std / saturation
+    if (
+        hasattr(model_3d, "token_fusion")
+        and model_3d.token_fusion is not None
+        and model_3d.token_fusion.gate_value is not None
+    ):
+        gv = model_3d.token_fusion.gate_value.detach().cpu()
+        numel = gv.numel()
+        sat0 = (gv < 0.01).sum().item() / numel
+        sat1 = (gv > 0.99).sum().item() / numel
+        logger.debug(
+            f"[Epoch {epoch}] Gate stats | "
+            f"mean={gv.mean():.4f} std={gv.std():.4f} "
+            f"min={gv.min():.4f} max={gv.max():.4f} "
+            f"saturated_0={sat0:.2%} saturated_1={sat1:.2%} "
+            f"residual_scale={model_3d.token_fusion.residual_scale.item():.4f}"
+        )
 
     return loss_sum / len(loader)
 
@@ -327,7 +345,7 @@ def main(cfg_path="config/train_stage2.yaml"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     seed_torch(train_cfg["seed"])
-    logger, sign = setup_logger(train_cfg)
+    logger, sign = setup_logger(cfg)
 
     # Dataset config includes lightweight pipeline image params
     ds_cfg = {**cfg["dataset"], "batch_size": train_cfg["batch_size"]}
