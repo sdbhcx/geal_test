@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-sys.path.append(".")
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 
 from dataset.data_utils import CLASSES, AFFORDANCES
 from dataset.laso import LasoDataset

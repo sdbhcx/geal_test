@@ -8,7 +8,7 @@ import argparse
 import os
 from torch.utils.data import DataLoader
 import sys
-sys.path.append(".")
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 
 from utils.utils import seed_torch, read_yaml
 from utils.logger import setup_logger
@@ -248,7 +248,7 @@ def main(cfg_path="config/train_stage1.yaml"):
 
     # Initialize random seed & logger
     seed_torch(train_cfg["seed"])
-    logger, sign = setup_logger(cfg["train"])
+    logger, sign = setup_logger(cfg)
 
     # Data pipeline
     train_loader, test_loader = build_dataloader({

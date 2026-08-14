@@ -3,7 +3,23 @@ import sys
 import time
 import logging
 
-def setup_logger(cfg_train, use_stdout=True):
+def _format_cfg(cfg, indent=0):
+    """Recursively format a nested config dict into indented lines."""
+    lines = []
+    pad = "   " * indent
+    if isinstance(cfg, dict):
+        for k, v in cfg.items():
+            if isinstance(v, dict):
+                lines.append(f"{pad}{k}:")
+                lines.extend(_format_cfg(v, indent + 1))
+            else:
+                lines.append(f"{pad}{k}: {v}")
+    else:
+        lines.append(f"{pad}{cfg}")
+    return lines
+
+
+def setup_logger(cfg, use_stdout=True):
     """
     Set up a unified training logger with both console and file outputs.
     The log file path is automatically created based on save_dir/name.
@@ -16,10 +32,11 @@ def setup_logger(cfg_train, use_stdout=True):
         logger (logging.Logger): ready-to-use logger instance
         run_tag (str): unique identifier for the current run (e.g., "PointRefer_at_11.04_23.15.42")
     """
+    cfg_train = cfg["train"]
     # === Generate timestamp and unique run identifier ===
     now = time.localtime()
     now_str = f"{now.tm_mon:02d}.{now.tm_mday:02d}_{now.tm_hour:02d}.{now.tm_min:02d}.{now.tm_sec:02d}"
-    run_tag = f"{cfg_train['name']}_at_{now_str}"
+    run_tag = f"{cfg_train['name']}_{cfg_train['log_name']}_at_{now_str}"
 
     # === Create log directory and file ===
     log_dir = os.path.join(cfg_train["save_dir"], cfg_train["name"], "logs")
@@ -56,9 +73,9 @@ def setup_logger(cfg_train, use_stdout=True):
     logger.info(f"New training session started: {run_tag}")
     logger.info(f"Log file: {log_file}")
     logger.info(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S', now)}")
-    logger.info("Configuration Summary:")
-    for k, v in cfg_train.items():
-        logger.info(f"   {k}: {v}")
+    logger.info("Configuration:")
+    for line in _format_cfg(cfg):
+        logger.info(line)
     logger.info("=" * 80 + "\n")
 
     return logger, run_tag

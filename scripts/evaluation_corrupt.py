@@ -14,7 +14,7 @@ import pandas as pd
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import sys
-sys.path.append(".")
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 
 from model.branch_3d import Branch3D
 from model.local_3d_tokenizer import validate_local_tokenizer_checkpoint
