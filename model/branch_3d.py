@@ -49,6 +49,7 @@ class Branch3D(nn.Module):
         self.training = cfg["training"]
         self.num_levels = cfg["level"]
         self.fuse_level = cfg.get("fuse_level", False)
+        self.gafm_internal = cfg.get("gafm_internal", "full")
 
         # ====== V1 continuous local 3D tokenizer ======
         tokenizer_cfg = cfg.get("local_tokenizer", {})
@@ -128,7 +129,8 @@ class Branch3D(nn.Module):
         self.GAFM_block = GAFMBlock(
             embed_dims=self.emb_dim,
             num_group_token=self.n_groups,
-            lan_dim=self.emb_dim
+            lan_dim=self.emb_dim,
+            internal_mode=self.gafm_internal,
         )
 
         # ====== Transformer decoder for cross-modal interaction ======

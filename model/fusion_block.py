@@ -231,6 +231,7 @@ class GAFMBlock(nn.Module):
                  group_att_cfg=dict(),
                  fwd_att_cfg=dict(),
                  ungroup_att_cfg=dict(),
+                 internal_mode="full",
                  **kwargs):
 
         super().__init__()
@@ -238,6 +239,7 @@ class GAFMBlock(nn.Module):
         self.embed_dims = embed_dims
         self.num_group_token = num_group_token
         self.with_cp = with_cp
+        self.internal_mode = internal_mode
 
         # self.group_token = nn.Parameter(torch.zeros(1, num_group_token, embed_dims))
         # trunc_normal_(self.group_token, std=.02)
@@ -288,6 +290,8 @@ class GAFMBlock(nn.Module):
 
 
     def forward(self, q, x, q_mask=None):
+        if self.internal_mode == "no_gafm":
+            return x
         """
         Args:
             x: image tokens, shape [B, L, C]
