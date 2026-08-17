@@ -25,6 +25,7 @@ from model.branch_2d import Branch2D
 from model.branch_3d import Branch3D
 from model.soft_prior_backprojector import SoftPriorBackprojector
 from utils.loss import HM_Loss
+from torch.utils.data.dataloader import default_collate
 
 # §9 Lightweight Pipeline imports (isolated from baseline path)
 try:
@@ -50,12 +51,50 @@ def count_trainable_params(model):
             print(f"Module: {name:20s} | Trainable params: {num / 1e6:.2f}M")
 
 
+def hoi_collate(batch):
+    """
+    Custom collate for HOI training: keeps H_raw xyz/conf as lists of numpy arrays
+    (variable-length per sample), default_collate for everything else.
+
+    Batch tuple layout:
+      - Baseline:        (point, class_id, mask, questions, aff_id, gt_mask)
+      - use_image:       + (image,)
+      - use_hoi:         + (h_raw_xyz_np, h_raw_conf_np)
+      - use_image+hoi:   + (image, h_raw_xyz_np, h_raw_conf_np)
+
+    HOI fields (last two when use_hoi) are kept as raw lists.
+    """
+    if not batch:
+        return batch
+    first = batch[0]
+    n = len(first)
+
+    # Detect HOI fields: last two elements are tensors / numpy arrays / None
+    has_hoi = n >= 8 and all(
+        (isinstance(item[n - 2], (np.ndarray, torch.Tensor, type(None))) and
+         isinstance(item[n - 1], (np.ndarray, torch.Tensor, type(None))))
+        for item in batch
+    )
+
+    result = []
+    for i in range(n):
+        col = [item[i] for item in batch]
+        if has_hoi and i in (n - 2, n - 1):
+            # Keep HOI fields as list of numpy arrays / None
+            result.append(col)
+        else:
+            result.append(default_collate(col))
+    return tuple(result)
+
+
 def build_dataloader(cfg):
     """Initialize train/test dataloaders."""
     ds_cfg = {
         "use_image": cfg.get("use_image", False),
         "img_size": cfg.get("img_size", 224),
         "k_images": cfg.get("k_images", 1),
+        "use_hoi": cfg.get("use_hoi", False),
+        "hoi_root": cfg.get("hoi_root", None),
     }
     if cfg["category"] == "piad":
         train_dataset = PiadDataset(
@@ -68,18 +107,22 @@ def build_dataloader(cfg):
         train_dataset = LasoDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])
         test_dataset = LasoDataset(cfg["test_split"], data_root=cfg["data_root"])
 
+    collate_fn = hoi_collate if ds_cfg["use_hoi"] else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg["batch_size"],
         num_workers=cfg["num_workers"],
         shuffle=True,
         drop_last=True,
+        collate_fn=collate_fn,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=cfg["batch_size"],
         num_workers=cfg["num_workers"],
         shuffle=False,
+        collate_fn=collate_fn,
     )
     return train_loader, test_loader
 
@@ -118,7 +161,7 @@ def build_optimizer(model_3d, opt_cfg, model_2d=None):
 
 def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
                     logger, epoch, train_cfg, img_3d_proj=None, anchor_proj=None,
-                    soft_prior_bp=None):
+                    soft_prior_bp=None, use_hoi=False, hoi_cfg=None):
     """
     One training epoch.
 
@@ -131,9 +174,17 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
       - L_3d2img: 3D→2D alignment (the only gradient source for the 3D branch)
       - L_contrastive: optional per-point contrastive loss
 
+    HOI Fusion path (when use_hoi is True):
+      - With-HOI path: 3D forward with H* from HOIHandler → L_full
+      - Without-HOI path: 3D forward with null_token → L_3d
+      - Hint KL distillation: KL(ω_3D || ω_full.detach) → L_hint
+      - CAM alignment: 2D renderer on without-HOI features → L_consis
+
     Args:
         img_3d_proj: nn.Linear from AffordanceProj output dim to 3D project_dim.
         anchor_proj: nn.Linear from DINO dim to AffordanceProj output dim.
+        use_hoi: whether HOI Fusion privileged hint is enabled.
+        hoi_cfg: HOI fusion config dict with lambda_3d, lambda_hint, lambda_consis, temperature.
     """
     model_3d.train()
     model_2d.eval()
@@ -204,36 +255,88 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
                 loss += train_cfg.get("contrastive_loss_weight", 0.1) * lw_cont
 
         else:
-            # ── Baseline path ───────────────────────────────────────────
-            question = batch[3]
+            # ── HOI Fusion path (privileged hint, training-time only) ──
+            if use_hoi:
+                question = batch[3]
+                # H_raw kept as list of numpy arrays via hoi_collate
+                h_raw_xyz, h_raw_conf = batch[6], batch[7]
 
-            if soft_prior_bp is not None:
-                # --- V2: 2D→3D soft-prior injection ---
-                # 1) Pure-3D forward to obtain the features the 2D renderer splats.
-                pred_3d, feat_3d = model_3d(question, point)
+                # Check if all samples have valid H_raw
+                if all(v is not None for v in h_raw_xyz):
+                    # H_raw → H* via HOIHandler (online, per-batch)
+                    H_star = model_3d.hoi_handler(h_raw_xyz, h_raw_conf)  # [B, k, d_model]
+                    hoi_active = True
+                else:
+                    hoi_active = False
 
-                # 2) Frozen 2D teacher: render + decode affordance map, and pull
-                #    back the splatting correspondences needed for backprojection.
-                feat_2d, render_feats, attn_map, render_idx, rendered_contrib = \
-                    model_2d(question, point, feat_3d, return_affordance_map=True)
+                lambda_3d = (hoi_cfg or {}).get("lambda_3d", 0.5)
+                lambda_hint = (hoi_cfg or {}).get("lambda_hint", 1.0)
+                lambda_consis = (hoi_cfg or {}).get("lambda_consis", 0.1)
+                temperature = (hoi_cfg or {}).get("temperature", 2.0)
 
-                # 3) Backproject the 2D prior onto the point cloud.
-                num_points = point.shape[-1]
-                q, u = soft_prior_bp(attn_map, render_idx, rendered_contrib,
-                                     num_points=num_points)
-                soft_prior = torch.stack([q, u], dim=1)   # [B, 2, N]
+                if hoi_active:
+                    # With-HOI path: full affordance prediction with HOI prior
+                    pred_full, _ = model_3d(question, point, hoi_feat=H_star)
+                    loss_full = criterion_hm(pred_full, label)
 
-                # 4) Re-run the 3D branch WITH the injected prior → final outputs.
-                pred_3d, feat_3d = model_3d(question, point, soft_prior=soft_prior)
+                    # Without-HOI path: null_token → CAM alignment + hint distillation
+                    pred_3d, feat_3d = model_3d(question, point, hoi_feat=None)
+                    loss_3d = criterion_hm(pred_3d, label)
+
+                    # 2D teacher forward on without-HOI features → CAM loss
+                    feat_2d, render_feats = model_2d(question, point, feat_3d)
+                    loss_kld = nn.MSELoss()(render_feats, feat_2d)
+
+                    # Hint KL distillation: push without-HOI toward with-HOI distribution
+                    loss_hint = F.kl_div(
+                        F.log_softmax(pred_3d / temperature, dim=-1),
+                        F.softmax(pred_full.detach() / temperature, dim=-1),
+                        reduction="batchmean",
+                    )
+
+                    loss = (loss_full
+                            + lambda_3d * loss_3d
+                            + lambda_hint * loss_hint
+                            + lambda_consis * loss_kld)
+                else:
+                    # Fallback: no valid H_raw, run standard baseline
+                    pred_3d, feat_3d = model_3d(question, point)
+                    feat_2d, render_feats = model_2d(question, point, feat_3d)
+                    loss_kld = nn.MSELoss()(render_feats, feat_2d)
+                    loss_hm = criterion_hm(pred_3d, label)
+                    loss = loss_hm + train_cfg["kl_loss_weight"] * loss_kld
+
             else:
-                pred_3d, feat_3d = model_3d(question, point)
-                feat_2d, render_feats = model_2d(question, point, feat_3d)
+                # ── Baseline path ───────────────────────────────────────────
+                question = batch[3]
 
-            loss_kld = nn.MSELoss()(render_feats, feat_2d)
-            loss_hm = criterion_hm(pred_3d, label)
-            loss = loss_hm + train_cfg["kl_loss_weight"] * loss_kld
+                if soft_prior_bp is not None:
+                    # --- V2: 2D→3D soft-prior injection ---
+                    # 1) Pure-3D forward to obtain the features the 2D renderer splats.
+                    pred_3d, feat_3d = model_3d(question, point)
 
-        loss.backward()
+                    # 2) Frozen 2D teacher: render + decode affordance map, and pull
+                    #    back the splatting correspondences needed for backprojection.
+                    feat_2d, render_feats, attn_map, render_idx, rendered_contrib = \
+                        model_2d(question, point, feat_3d, return_affordance_map=True)
+
+                    # 3) Backproject the 2D prior onto the point cloud.
+                    num_points = point.shape[-1]
+                    q, u = soft_prior_bp(attn_map, render_idx, rendered_contrib,
+                                         num_points=num_points)
+                    soft_prior = torch.stack([q, u], dim=1)   # [B, 2, N]
+
+                    # 4) Re-run the 3D branch WITH the injected prior → final outputs.
+                    pred_3d, feat_3d = model_3d(question, point, soft_prior=soft_prior)
+                else:
+                    pred_3d, feat_3d = model_3d(question, point)
+                    feat_2d, render_feats = model_2d(question, point, feat_3d)
+
+                loss_kld = nn.MSELoss()(render_feats, feat_2d)
+                loss_hm = criterion_hm(pred_3d, label)
+                loss = loss_hm + train_cfg["kl_loss_weight"] * loss_kld
+
+            loss.backward()
         optimizer.step()
         loss_sum += loss.item()
 
@@ -243,6 +346,12 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
                     f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f} "
                     f"(hm: {loss_hm.item():.4f}, mse: {loss_kld.item():.4f}, "
                     f"inv: {lw_inv.item():.4f}, 3d2img: {lw_3d2img.item():.4f})"
+                )
+            elif use_hoi and hoi_active:
+                logger.debug(
+                    f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f} "
+                    f"(full: {loss_full.item():.4f}, 3d: {loss_3d.item():.4f}, "
+                    f"hint: {loss_hint.item():.4f}, consis: {loss_kld.item():.4f})"
                 )
             else:
                 logger.debug(
@@ -352,6 +461,21 @@ def main(cfg_path="config/train_stage2.yaml"):
     ds_cfg["use_image"] = ds_cfg.get("use_image", False)
     ds_cfg["k_images"] = ds_cfg.get("k_images", 1)
     ds_cfg["img_size"] = ds_cfg.get("img_size", 224)
+
+    # HOI Fusion config
+    hoi_cfg = cfg["model_3d"].get("hoi_fusion", {})
+    use_hoi = hoi_cfg.get("enabled", False)
+    if use_hoi:
+        ds_cfg["use_hoi"] = True
+        ds_cfg["hoi_root"] = train_cfg.get("hoi_data_root", "/home/datasets/PIAD_root/HOI")
+        logger.debug(f"[HOI] Fusion enabled | lambda_3d={hoi_cfg.get('lambda_3d', 0.5)} "
+                     f"lambda_hint={hoi_cfg.get('lambda_hint', 1.0)} "
+                     f"lambda_consis={hoi_cfg.get('lambda_consis', 0.1)} "
+                     f"temperature={hoi_cfg.get('temperature', 2.0)}")
+    else:
+        ds_cfg["use_hoi"] = False
+        ds_cfg["hoi_root"] = None
+
     train_loader, test_loader = build_dataloader(ds_cfg)
 
     # Build models
@@ -413,7 +537,8 @@ def main(cfg_path="config/train_stage2.yaml"):
         train_loss = train_one_epoch(model_3d, model_2d, train_loader, optimizer, device,
                                      criterion_hm, logger, epoch, train_cfg,
                                      img_3d_proj=img_3d_proj, anchor_proj=anchor_proj,
-                                     soft_prior_bp=soft_prior_bp)
+                                     soft_prior_bp=soft_prior_bp,
+                                     use_hoi=use_hoi, hoi_cfg=hoi_cfg)
         IOU, mae = evaluate(model_3d, test_loader, device, criterion_hm, logger)
         scheduler.step()
 

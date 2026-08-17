@@ -25,21 +25,23 @@ class PiadDataset(Dataset):
         - 12 viewpoint-conditioned affordance questions
         - affordance label ID
         - ground truth affordance mask
+        - (optional) interaction image [3, H, W] or [k, 3, H, W]
+        - (optional, use_hoi) H_raw xyz [M, 3] and conf [M] from VGGT
     """
 
     def __init__(self, split: str = "train", setting: str = "seen", data_root: str = "piad_dataset",
-                 use_image: bool = False, img_size: int = 224, k_images: int = 1):
+                 use_image: bool = False, img_size: int = 224, k_images: int = 1,
+                 use_hoi: bool = False, hoi_root: str = None):
         """
         Args:
             split (str): "train" or "test"
             setting (str): "seen" or "unseen"
             data_root (str): path to PIAD dataset root
-            use_image (bool): if True, also return interaction images sampled
-                from the (class, affordance) pool built by the dataset index.
+            use_image (bool): if True, also return interaction images.
             img_size (int): square size the interaction image is resized to.
-            k_images (int): number of interaction images to sample per
-                (class, affordance) pair.  k_images > 1 returns a stacked
-                tensor [k, 3, H, W].
+            k_images (int): number of interaction images to sample.
+            use_hoi (bool): if True, also return H_raw (xyz + conf) from VGGT.
+            hoi_root (str): path to HOI npz root, e.g. /home/datasets/PIAD_root/HOI
         """
         self.split = split
         self.setting = setting
@@ -47,6 +49,8 @@ class PiadDataset(Dataset):
         self.use_image = use_image
         self.img_size = img_size
         self.k_images = k_images
+        self.use_hoi = use_hoi
+        self.hoi_root = hoi_root
 
         # Build class and affordance name → index mappings
         self.class_to_idx = {cls.lower(): i for i, cls in enumerate(CLASSES)}
@@ -71,8 +75,14 @@ class PiadDataset(Dataset):
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
 
+        # Optionally build the (class, affordance) -> [npz_paths] index for HOI
+        self.hoi_index = None
+        if self.use_hoi:
+            self.hoi_index = self._build_hoi_index_from_folder()
+
         print(f"[PIAD] Loaded {split} split ({len(self.annotations)} samples, "
-              f"setting={setting}, use_image={use_image}, k_images={k_images})")
+              f"setting={setting}, use_image={use_image}, k_images={k_images}, "
+              f"use_hoi={use_hoi})")
 
     # ------------------------------------------------------------------
     def _sample_question(self, object_name: str, affordance: str) -> str:
@@ -139,10 +149,20 @@ class PiadDataset(Dataset):
                     self._load_and_transform(obj_class.lower(), affordance)
                     for _ in range(self.k_images)
                 ])
+                if self.use_hoi:
+                    h_raw_xyz, h_raw_conf = self._load_h_raw(obj_class.lower(), affordance)
+                    return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, imgs, h_raw_xyz, h_raw_conf
                 return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, imgs
             image_pil = self._sample_image(obj_class.lower(), affordance)
             image = self.img_transform(image_pil)
+            if self.use_hoi:
+                h_raw_xyz, h_raw_conf = self._load_h_raw(obj_class.lower(), affordance)
+                return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, image, h_raw_xyz, h_raw_conf
             return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, image
+
+        if self.use_hoi:
+            h_raw_xyz, h_raw_conf = self._load_h_raw(obj_class.lower(), affordance)
+            return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, h_raw_xyz, h_raw_conf
 
         return point_input, class_id, binary_mask, questions, affordance_id, gt_mask
 
@@ -175,6 +195,68 @@ class PiadDataset(Dataset):
         path = self._sample_image_path(obj_class, affordance)
         image_pil = Image.open(path).convert("RGB")
         return self.img_transform(image_pil)
+
+    # ------------------------------------------------------------------
+    # HOI (H_raw from VGGT reconstruction) loading
+    # ------------------------------------------------------------------
+
+    def _build_hoi_index_from_folder(self):
+        """
+        Scan the HOI npz folder structure to build
+        {(class_lower, affordance_norm): [npz_path, ...]} index.
+
+        Folders: {hoi_root}/{setting}/{split}/{Class}/{affordance}/Img_*.npz
+        """
+        if self.hoi_root is None:
+            return None
+        hoi_index = {}
+        setting_dir = self.setting  # HOI uses lowercase: seen/train
+        split_dir = self.split
+        base = os.path.join(self.hoi_root, setting_dir, split_dir)
+        if not os.path.isdir(base):
+            return hoi_index
+        for cls_name in sorted(os.listdir(base)):
+            cls_dir = os.path.join(base, cls_name)
+            if not os.path.isdir(cls_dir):
+                continue
+            for aff_name in sorted(os.listdir(cls_dir)):
+                aff_dir = os.path.join(cls_dir, aff_name)
+                if not os.path.isdir(aff_dir):
+                    continue
+                # Normalize affordance name: wrapgrasp → wrap_grasp
+                aff_norm = aff_name.replace("wrapgrasp", "wrap_grasp")
+                paths = sorted([
+                    os.path.join(aff_dir, f)
+                    for f in os.listdir(aff_dir) if f.endswith(".npz")
+                ])
+                if paths:
+                    hoi_index[(cls_name.lower(), aff_norm)] = paths
+        return hoi_index
+
+    def _load_h_raw(self, obj_class: str, affordance: str):
+        """
+        Sample one H_raw npz for the (class, affordance) pair.
+        Returns (xyz: Tensor [M, 3] float32, conf: Tensor [M] float32) or (None, None).
+        """
+        if self.hoi_index is None:
+            return None, None
+        paths = self.hoi_index.get((obj_class, affordance))
+        if not paths:
+            # Fallback: any HOI for the same class
+            paths = [
+                p for (c, _a), ps in self.hoi_index.items()
+                if c == obj_class for p in ps
+            ]
+        if not paths:
+            return None, None
+        path = random.choice(paths) if self.split == "train" else paths[0]
+        try:
+            data = np.load(path, allow_pickle=True)
+            xyz = torch.tensor(data["xyz"], dtype=torch.float32)
+            conf = torch.tensor(data["conf"], dtype=torch.float32)
+            return xyz, conf
+        except Exception:
+            return None, None
 
     # ------------------------------------------------------------------
     def _build_image_index_from_folder(self):

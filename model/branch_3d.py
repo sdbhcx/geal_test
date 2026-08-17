@@ -8,6 +8,8 @@ from model.fusion_block import GAFMBlock
 from model.layers import PointFeatureDownsampler,PointEncoder
 from model.gaf_conv import GafConv
 from model.local_3d_tokenizer import Local3DTokenizer, TokenFusion, TokenToPointInterpolator
+from model.hoi_handler import HOIHandler, HStarCfg
+from model.hoi_fusion import HOIFusion
 from transformers import AutoModel, AutoTokenizer
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -101,6 +103,20 @@ class Branch3D(nn.Module):
             # Near-zero gate — mirrors TokenFusion's residual_scale=0.0 init.
             self.soft_prior_gate = nn.Parameter(torch.tensor(0.0))
 
+        # ====== HOI Fusion (privileged hint, training-time only) ======
+        # H_raw (VGGT 重建) → HOIHandler → H* (可学习 AnchorEncoder)
+        # HOIFusion: cross-attn(P~, H*) → P~_aug, 推理期 H*=None 退化到 null_token
+        hoi_cfg = cfg.get("hoi_fusion", {})
+        self.use_hoi_fusion = hoi_cfg.get("enabled", False)
+        if self.use_hoi_fusion:
+            hstar_cfg_dict = hoi_cfg.get("hstar_cfg", {})
+            self.hstar_cfg = HStarCfg(**hstar_cfg_dict)
+            self.hoi_handler = HOIHandler(self.hstar_cfg)
+            self.hoi_fusion = HOIFusion(
+                d_model=hoi_cfg.get("d_model", self.emb_dim),
+                n_heads=hoi_cfg.get("n_heads", 4),
+            )
+
         # ====== Text encoder (frozen or finetuned) ======
         self.text_encoder = AutoModel.from_pretrained(self.text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(self.text_encoder_type)
@@ -164,7 +180,7 @@ class Branch3D(nn.Module):
 
     # ----------------------------------------------------------------------
 
-    def forward(self, text, xyz, soft_prior=None):
+    def forward(self, text, xyz, soft_prior=None, hoi_feat=None):
         """
         Forward pass of the 3D branch.
 
@@ -175,6 +191,9 @@ class Branch3D(nn.Module):
                 where soft_prior[:, 0] is the prior affordance q and soft_prior[:, 1]
                 is the cross-view uncertainty u. When None (inference or disabled),
                 the branch behaves exactly like the baseline.
+            hoi_feat (Tensor | None): HOI anchor features H* of shape [B, k, d_model].
+                Training-time privileged hint from HOIHandler. When None (inference
+                or disabled), HOIFusion degrades to null_token (near-identity).
 
         Returns:
             - During training: (affordance_pred, downsampled_feats)
@@ -249,6 +268,12 @@ class Branch3D(nn.Module):
             token_aux["point_to_token_dist_orig"] = torch.sqrt(dist_orig.gather(
                 -1, point_idx_orig
             ))
+
+        # ========== Step 5d. HOIFusion (privileged hint, training-time only) ==========
+        if self.use_hoi_fusion and hoi_feat is not None:
+            fused_feat = self.hoi_fusion(
+                fused_feat.transpose(-2, -1), hoi_feat
+            ).transpose(-2, -1)
 
         # ========== Step 6. Transformer-based decoding ==========
         text_decoded = self.decoder(
